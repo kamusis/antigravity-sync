@@ -27,6 +27,48 @@ python -m antigravity_sync --help
 
 ---
 
+## Typical Workflows
+
+### Daily: keep two machines in sync
+
+```bash
+# 1. Close Antigravity on BOTH machines (the LanguageServer flushes state on
+#    exit and would overwrite merged data otherwise)
+# 2. From either machine:
+python -m antigravity_sync sync --remote macbook
+# 3. Reopen Antigravity
+```
+
+The sync is bidirectional and incremental: it compares conversation sets and
+`last_modified_time`, pushes/pulls only what differs, and automatically aligns
+workspace paths, project UUIDs, FTS slugs, trajectory blobs, titles, and
+per-conversation annotations across platforms. Run `--dry-run` first to preview.
+
+### Migrate to a new machine
+
+```bash
+antigravity-sync export -o conversations.agypkg      # on the source machine
+scp conversations.agypkg newmachine:/tmp/
+antigravity-sync import /tmp/conversations.agypkg \
+    --remap-workspace "C:/Users/alice=D:/Users/bob"  # on the target machine
+```
+
+### Something looks wrong (lost grouping / titles)
+
+```bash
+# Check the local state (counts, blob census, titles, pb cache)
+python scripts/verify_repair.py win <peer_snapshot.json>
+
+# Rebuild metadata from pristine backups + a peer snapshot (dry-run by default)
+python scripts/repair_metadata.py snapshot --side win -o peer.json   # on the peer
+python scripts/repair_metadata.py repair --side win --peer-snapshot peer.json --apply
+```
+
+See `docs/conversation-title-debug-and-fix.md` for how the metadata layers work
+and why the repair tool patches each of them.
+
+---
+
 ## Usage
 
 ### 1. Export Conversations
