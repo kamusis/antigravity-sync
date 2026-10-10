@@ -225,10 +225,44 @@ DETACH DATABASE src;
 
 ---
 
-## 6. 实施步骤规划
+## 6. 实施步骤与演进
 
 1. **第 1 步 (底层引擎封装)**：编写 `storage.py`（跨平台路径定位、安全只读备份、WAL 处理）。
 2. **第 2 步 (打包与解包)**：编写 `bundle.py`（ZIP 流式打包、`manifest.json` 构造、校验与解压）。
 3. **第 3 步 (数据库合并器)**：编写 `merger.py`（SQLite ATTACH、UPSERT、FTS5 同步、路径重映射）。
-4. **第 4 步 (CLI 接口组装)**：编写 `main.py`（基于 `argparse` 的统一命令行接口与优雅日志输出）。
-5. **第 5 步 (自测验证)**：在本地当前环境对真实数据执行一次 export ➔ inspect ➔ merge 演练，确保数据无损。
+4. **第 4 步 (CLI 接口组装)**：编写 `cli.py` / `__main__.py`（基于 `argparse` 的统一命令行接口与优雅日志输出）。
+5. **第 5 步 (远程 SSH 同步)**：编写 `remote.py`，支持基于 SSH/SCP 的一键端到端双向增量同步。
+6. **第 6 步 (Protobuf 缓存与项目对齐)**：突破 Antigravity 2.0 双层存储结构（SQLite + `agyhub_summaries_proto.pb`），实现跨设备 Project UUID 与会话名称无损对齐。
+
+---
+
+## 7. 进阶核心机制 (Advanced Architecture)
+
+### 7.1 双层存储与 Protobuf 摘要缓存同步机制
+
+Antigravity 2.0 (LanguageServer) 内部采用双层会话索引体系：
+1. **SQLite 数据库层 (`conversation_summaries.db`)**：存储结构化元数据、全文检索倒排索引（FTS5）以及 `raw_summary` 二进制 Protobuf Blob。
+2. **内存/磁盘持久化快照 (`agyhub_summaries_proto.pb`)**：LanguageServer 启动时通过 `init_unmarshal_new_format` 加载的持久化缓存。若磁盘中新增了 `conversations/<id>.db` 但 `agyhub_summaries_proto.pb` 中缺失对应条目，LanguageServer 会触发回退机制（Fallback），强制从 Step 0 抓取原始 Prompt/URL 作为标题，覆盖 SQLite 中的 AI 摘要。
+
+**技术方案**：
+- 在 `proto_utils.py` 中基于纯 Python 标准库实现 Protobuf Wire Format 编解码器（零外部依赖）。
+- 导出时，将选中会话的 Protobuf 条目单独打包为 `agyhub_summaries.pb`。
+- 导入时，无损解析并合并进目标机器的 `agyhub_summaries_proto.pb`，彻底杜绝会话标题退化为原始 URL 的问题。
+
+### 7.2 动态工作区对齐与 Project ID 智能重映射
+
+Antigravity UI 侧边栏按 `project_id`（每个环境在添加工作区时动态生成的 UUID）对会话进行分组归类，而非仅根据绝对文件路径匹配：
+- **Windows `mopheus`**：`project_id = 'cc43b06d-e24a-4b42-8a2f-4112ee58ef8b'`, URI: `file:///c%3A/Users/kamus/CascadeProjects/mopheus`
+- **macOS `mopheus`**：`project_id = '05f52f38-58c8-4a26-9357-4df001980345'`, URI: `file:///Users/kamus/CascadeProjects/mopheus`
+
+**技术方案**：
+- 在 `workspace_mapper.py` 中实现基于项目 Slug（如 `CascadeProjects/mopheus`）的自动探查与匹配算法。
+- 双向同步时，先探测双方机器的全部活跃工作区，动态生成双向 Project ID 映射字典与 URI 转换规则表。
+- 导入时执行原子重映射，使来自另一台机器的会话自动归集至当前机器对应的工作区文件夹下。
+
+### 7.3 会话标题与预览双向防丢失机制
+
+在 SQLite 索引库中：
+- 若会话仅具备 `preview`（AI 摘要名称）而 `title` 为空，自动以 `preview` 填充 `title`。
+- 若会话仅具备 `title` 而 `preview` 为空，自动以 `title` 填充 `preview`。
+- 同步更新 `conversations_fts` 全文索引，确保跨机导入后在搜索框（Search）中搜索会话名称能秒级准确定位。

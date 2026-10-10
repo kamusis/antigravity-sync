@@ -4,9 +4,11 @@ Command-line interface entry point for antigravity-sync.
 
 import sys
 import argparse
+import time
+import tempfile
 import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from antigravity_sync import __version__
 from antigravity_sync.storage import (
@@ -19,10 +21,13 @@ from antigravity_sync.bundle import (
     read_bundle_manifest,
 )
 from antigravity_sync.merger import import_bundle
-import time
-import tempfile
+from antigravity_sync.workspace_mapper import (
+    get_workspaces_from_db,
+    build_alignment_mappings,
+)
 from antigravity_sync.remote import (
     get_remote_conversations,
+    get_remote_workspaces,
     get_remote_platform,
     auto_detect_remapping,
     run_ssh_command,
@@ -143,6 +148,16 @@ def cmd_import(args: argparse.Namespace) -> int:
             old_p, new_p = pair.split("=", 1)
             remap_pairs.append((old_p.strip(), new_p.strip()))
 
+    # Parse project ID remapping pairs
+    project_id_map: Dict[str, str] = {}
+    if getattr(args, "remap_project_id", None):
+        for pair in args.remap_project_id:
+            if "=" not in pair:
+                print(f"Error: Invalid --remap-project-id argument '{pair}'. Expected OLD=NEW.", file=sys.stderr)
+                return 1
+            old_pid, new_pid = pair.split("=", 1)
+            project_id_map[old_pid.strip()] = new_pid.strip()
+
     print(f"[*] Target Antigravity directory: {target_dir}")
     print(f"[*] Inspecting bundle: {bundle_path}")
 
@@ -162,6 +177,11 @@ def cmd_import(args: argparse.Namespace) -> int:
         for old_p, new_p in remap_pairs:
             print(f"    '{old_p}' -> '{new_p}'")
 
+    if project_id_map:
+        print("[*] Project ID remapping rules:")
+        for old_pid, new_pid in project_id_map.items():
+            print(f"    '{old_pid[:8]}' -> '{new_pid[:8]}'")
+
     if args.dry_run:
         print("\n--- [DRY-RUN PLAN] ---")
     else:
@@ -172,6 +192,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         target_dir=target_dir,
         mode=args.mode,
         remap_workspaces=remap_pairs if remap_pairs else None,
+        project_id_map=project_id_map if project_id_map else None,
         dry_run=args.dry_run,
         create_backup=not args.no_backup,
     )
@@ -347,12 +368,43 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print("\n[!] Dry run complete. No data transferred.")
         return 0
 
-    # Auto-detect path remapping
+    # Auto-detect path and project alignment
     remote_plat = get_remote_platform(remote_host)
     local_user = Path.home().name
     rc, r_user_out, _ = run_ssh_command(remote_host, "whoami")
     remote_user = r_user_out.strip() or local_user
-    push_remap, pull_remap = auto_detect_remapping(local_user, remote_user, remote_plat)
+    local_plat = "Windows" if sys.platform == "win32" else ("Darwin" if sys.platform == "darwin" else "Linux")
+
+    print("[*] Discovering and aligning workspaces across machines...")
+    local_ws = get_workspaces_from_db(db_path)
+    try:
+        remote_ws = get_remote_workspaces(remote_host)
+    except Exception as e:
+        print(f"    Warning: Could not fetch remote workspace list: {e}")
+        remote_ws = {}
+
+    push_pid_map, push_remap = build_alignment_mappings(
+        source_workspaces=local_ws,
+        target_workspaces=remote_ws,
+        source_user=local_user,
+        target_user=remote_user,
+        source_platform=local_plat,
+        target_platform=remote_plat,
+    )
+
+    pull_pid_map, pull_remap = build_alignment_mappings(
+        source_workspaces=remote_ws,
+        target_workspaces=local_ws,
+        source_user=remote_user,
+        target_user=local_user,
+        source_platform=remote_plat,
+        target_platform=local_plat,
+    )
+
+    if push_pid_map:
+        print(f"    Aligned {len(push_pid_map)} project ID(s) for push to remote.")
+    if pull_pid_map:
+        print(f"    Aligned {len(pull_pid_map)} project ID(s) for pull to local.")
 
     # 1. PUSH to remote
     if to_push_ids and not args.pull_only:
@@ -367,7 +419,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             scp_upload(remote_host, local_bundle, remote_tmp)
 
             remap_args = " ".join(f'--remap-workspace "{old}={new}"' for old, new in push_remap)
-            import_cmd = f"PYTHONPATH=~/CascadeProjects/antigravity-sync python3 -m antigravity_sync import {remote_tmp} {remap_args} --force"
+            pid_args = " ".join(f'--remap-project-id "{old}={new}"' for old, new in push_pid_map.items())
+            import_cmd = f"PYTHONPATH=~/CascadeProjects/antigravity-sync python3 -m antigravity_sync import {remote_tmp} {remap_args} {pid_args} --force"
             print(f"[*] [PUSH] Merging on {remote_host}...")
             rc, out, err = run_ssh_command(remote_host, import_cmd)
             run_ssh_command(remote_host, f"rm -f {remote_tmp}")
@@ -401,6 +454,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 target_dir=base_dir,
                 mode="merge",
                 remap_workspaces=pull_remap if pull_remap else None,
+                project_id_map=pull_pid_map if pull_pid_map else None,
                 create_backup=True,
             )
             print(f"[+] [PULL] Successfully pulled and merged {len(to_pull_ids)} conversations into local!")
@@ -444,6 +498,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_import.add_argument("--dir", help="Custom target Antigravity data directory")
     p_import.add_argument("--mode", choices=["merge", "overwrite"], default="merge", help="Import mode (default: merge)")
     p_import.add_argument("--remap-workspace", action="append", help="Remap workspace paths: OLD=NEW")
+    p_import.add_argument("--remap-project-id", action="append", help="Remap project UUID: OLD=NEW")
     p_import.add_argument("--dry-run", action="store_true", help="Inspect and simulate import without writing")
     p_import.add_argument("--no-backup", action="store_true", help="Skip creating backup of current summaries.db")
     p_import.add_argument("--force", action="store_true", help="Proceed even if Antigravity is running")

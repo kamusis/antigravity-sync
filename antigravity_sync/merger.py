@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 
 from antigravity_sync.storage import backup_file, get_antigravity_dir
 from antigravity_sync.bundle import extract_bundle, read_bundle_manifest
+from antigravity_sync.proto_utils import read_agyhub_proto_file, merge_agyhub_proto_file
 
 
 def get_table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
@@ -35,6 +36,7 @@ def merge_summaries_db(
     target_db_path: Path,
     source_db_path: Path,
     remap_workspaces: Optional[List[Tuple[str, str]]] = None,
+    project_id_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, int]:
     """Merge a source summaries database into the target summaries database using ATTACH and UPSERT.
 
@@ -42,6 +44,7 @@ def merge_summaries_db(
         target_db_path: Path to target conversation_summaries.db.
         source_db_path: Path to source conversation_summaries.db from bundle.
         remap_workspaces: Optional list of (old_prefix, new_prefix) path pairs to remap.
+        project_id_map: Optional dict mapping source project_id to target project_id.
 
     Returns:
         Dictionary with count statistics {'inserted': int, 'updated': int}.
@@ -117,7 +120,32 @@ def merge_summaries_db(
                 SELECT {cols_clause} FROM src.conversations_fts;
             """)
 
-        # 3. Apply path remapping if requested
+        # 3. Synchronize title and preview so sessions never appear untitled
+        cursor.execute("""
+            UPDATE conversation_summaries
+            SET title = preview
+            WHERE (title IS NULL OR title = '') AND preview IS NOT NULL AND preview != '';
+        """)
+        cursor.execute("""
+            UPDATE conversation_summaries
+            SET preview = title
+            WHERE (preview IS NULL OR preview = '') AND title IS NOT NULL AND title != '';
+        """)
+
+        # 4. Remap project IDs across machines
+        if project_id_map:
+            for s_pid, t_pid in project_id_map.items():
+                cursor.execute(
+                    "UPDATE conversation_summaries SET project_id = ? WHERE project_id = ?;",
+                    (t_pid, s_pid),
+                )
+                if target_has_fts:
+                    cursor.execute(
+                        "UPDATE conversations_fts SET project = ? WHERE project = ?;",
+                        (t_pid, s_pid),
+                    )
+
+        # 5. Apply path remapping if requested
         if remap_workspaces:
             for old_path, new_path in remap_workspaces:
                 cursor.execute(
@@ -131,6 +159,12 @@ def merge_summaries_db(
                     )
 
         target_conn.commit()
+
+        # Checkpoint WAL cleanly
+        try:
+            target_conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except sqlite3.OperationalError:
+            pass
     finally:
         try:
             cursor.execute("DETACH DATABASE src;")
@@ -171,6 +205,7 @@ def import_bundle(
     target_dir: Optional[Path] = None,
     mode: str = "merge",
     remap_workspaces: Optional[List[Tuple[str, str]]] = None,
+    project_id_map: Optional[Dict[str, str]] = None,
     dry_run: bool = False,
     create_backup: bool = True,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
@@ -182,6 +217,7 @@ def import_bundle(
         target_dir: Root target Antigravity directory (defaults to user standard directory).
         mode: 'merge' (incremental merge) or 'overwrite' (replace all).
         remap_workspaces: Optional list of (old_path, new_path) pairs for workspace URI replacement.
+        project_id_map: Optional dict mapping source project_id to target project_id.
         dry_run: If True, only inspect and report plan without modifying files.
         create_backup: Whether to create a backup of target summaries.db before importing.
         progress_callback: Optional callback func(item_name, current_index, total_count).
@@ -254,6 +290,19 @@ def import_bundle(
         # 5. Merge SQLite indexes
         src_db_path = temp_dir / "conversation_summaries.db"
         if src_db_path.exists():
-            merge_summaries_db(target_db_path, src_db_path, remap_workspaces=remap_workspaces)
+            merge_summaries_db(
+                target_db_path,
+                src_db_path,
+                remap_workspaces=remap_workspaces,
+                project_id_map=project_id_map,
+            )
+
+        # 6. Merge protobuf cache (agyhub_summaries_proto.pb)
+        src_pb_path = temp_dir / "agyhub_summaries.pb"
+        target_pb_path = target / "agyhub_summaries_proto.pb"
+        if src_pb_path.exists():
+            incoming_pb = read_agyhub_proto_file(src_pb_path)
+            if incoming_pb:
+                merge_agyhub_proto_file(target_pb_path, incoming_pb)
 
     return report

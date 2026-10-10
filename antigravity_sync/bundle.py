@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 
 from antigravity_sync.storage import create_safe_db_snapshot
+from antigravity_sync.proto_utils import read_agyhub_proto_file, encode_agyhub_proto
 
 
 BUNDLE_VERSION = "1.0"
@@ -91,6 +92,17 @@ def create_bundle(
         if temp_db_path.exists():
             files_to_pack.append((temp_db_path, "conversation_summaries.db"))
             total_uncompressed_bytes += temp_db_path.stat().st_size
+
+        # Include filtered agyhub_summaries_proto.pb if present
+        proto_path = antigravity_dir / "agyhub_summaries_proto.pb"
+        if proto_path.exists():
+            proto_entries = read_agyhub_proto_file(proto_path)
+            filtered_entries = {cid: proto_entries[cid] for cid in conv_ids if cid in proto_entries}
+            if filtered_entries:
+                temp_pb_path = temp_dir / "agyhub_summaries.pb"
+                temp_pb_path.write_bytes(encode_agyhub_proto(filtered_entries))
+                files_to_pack.append((temp_pb_path, "agyhub_summaries.pb"))
+                total_uncompressed_bytes += temp_pb_path.stat().st_size
 
         total_convs = len(conversations)
         for idx, conv in enumerate(conversations):
