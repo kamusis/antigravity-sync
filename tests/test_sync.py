@@ -401,6 +401,32 @@ class TestPathReplacement(unittest.TestCase):
         blob = make_trajectory_blob("file:///Users/kamus/x", "05f52f38-58c8-4a26-9357-4df001980345")
         self.assertEqual(transform_proto_bytes(blob, []), blob)
 
+    def test_set_summary_title_field1_and_151(self):
+        """set_summary_title writes both field 1 and field 15.1."""
+        from antigravity_sync.proto_utils import set_summary_title, _parse_fields_strict
+        raw = (
+            encode_pb_string(1, b"old prompt title")
+            + encode_pb_string(2, b"\x01")
+            + encode_pb_string(15, encode_pb_string(7, b"\x08\x01"))
+        )
+        out = set_summary_title(raw, "Clean Title")
+        fields = _parse_fields_strict(out)
+        self.assertEqual(fields[0][2], b"Clean Title")
+        f15 = fields[2][2]
+        sub = _parse_fields_strict(f15)
+        self.assertEqual(sub[0][0], 1)
+        self.assertEqual(sub[0][2], b"Clean Title")
+        self.assertEqual(sub[1][0], 7)
+
+    def test_set_summary_title_skips_unparseable_field15(self):
+        """An unparseable field 15 must be left untouched, not dropped."""
+        from antigravity_sync.proto_utils import set_summary_title, _parse_fields_strict
+        raw = encode_pb_string(1, b"old") + encode_pb_string(15, b"\xff\xff\xff")
+        out = set_summary_title(raw, "T")
+        fields = _parse_fields_strict(out)
+        self.assertEqual(fields[0][2], b"T")
+        self.assertEqual(fields[1][2], b"\xff\xff\xff")
+
 
 class TestBlobPatching(unittest.TestCase):
     """Tests for trajectory_metadata_blob patching during import."""

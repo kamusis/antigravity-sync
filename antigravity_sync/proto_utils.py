@@ -291,26 +291,53 @@ def build_one_pass_replacer(replacements: List[Tuple[object, bytes]]):
     return lambda data: pattern.sub(lambda m: mapping[m.lastindex], data)
 
 
-def set_leading_string_field(data: bytes, value: str) -> bytes:
-    """Replace the payload of field 1 (wire type 2) in a top-level protobuf message.
+def set_summary_title(data: bytes, title: str) -> bytes:
+    """Set the conversation title inside a raw_summary protobuf.
 
-    The raw_summary protobuf carries the conversation title in field 1; the
-    LanguageServer re-derives the displayed title from it when a conversation
-    is opened, so a stale field 1 makes the title revert to the raw prompt.
+    The title lives in two places: top-level field 1 and field 15.1 (the
+    persisted title state). When field 15.1 is missing, the LanguageServer
+    re-derives the title from the first user message whenever the
+    conversation is opened, reverting the displayed title to the raw prompt.
 
     Args:
-        data: Raw protobuf bytes (e.g. raw_summary).
-        value: New string value for field 1.
+        data: Raw protobuf bytes of the summary.
+        title: Title string to store.
 
     Returns:
-        Re-encoded protobuf bytes, or the input unchanged when field 1 is
-        not a length-delimited field.
+        Re-encoded protobuf bytes.
     """
     fields = _parse_fields_strict(data)
-    if not fields or fields[0][1] != 2:
+    if fields is None:
         return data
-    new_fields = [(fields[0][0], 2, value.encode("utf-8"))] + list(fields[1:])
-    return _serialize_fields(new_fields)
+    title_payload = title.encode("utf-8")
+    out = []
+    changed = False
+    for field_num, wire_type, value in fields:
+        if field_num == 1 and wire_type == 2:
+            if value != title_payload:
+                value, changed = title_payload, True
+        elif field_num == 15 and wire_type == 2:
+            sub = _parse_fields_strict(value)
+            if sub is not None:
+                new_sub = []
+                sub_changed = False
+                has_title = False
+                for s_field, s_wt, s_val in sub:
+                    if s_field == 1 and s_wt == 2:
+                        has_title = True
+                        if s_val != title_payload:
+                            s_val, sub_changed = title_payload, True
+                    new_sub.append((s_field, s_wt, s_val))
+                if not has_title:
+                    # Insert 15.1 as the first entry to match native layout.
+                    new_sub = [(1, 2, title_payload)] + new_sub
+                    sub_changed = True
+                if sub_changed:
+                    value, changed = _serialize_fields(new_sub), True
+        out.append((field_num, wire_type, value))
+    if not changed:
+        return data
+    return _serialize_fields(out)
 
 
 def transform_proto_bytes(data: bytes, replacements: List[Tuple[bytes, bytes]]) -> bytes:

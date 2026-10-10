@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from antigravity_sync.proto_utils import (  # noqa: E402
     build_one_pass_replacer,
     merge_agyhub_proto_file,
-    set_leading_string_field,
+    set_summary_title,
     transform_proto_bytes,
 )
 from antigravity_sync.storage import get_antigravity_dir, backup_file  # noqa: E402
@@ -279,7 +279,7 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
         raw_bytes = base64.b64decode(raw_b64) if raw_b64 else b""
         new_raw = transform_proto_bytes(raw_bytes, replacements) if raw_bytes else b""
         if new_raw and title:
-            new_raw = set_leading_string_field(new_raw, title)
+            new_raw = set_summary_title(new_raw, title)
         titles[cid] = title
 
         if live_row is None:
@@ -403,7 +403,7 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
         new_raw = transform_proto_bytes(raw, replacements)
         title = titles.get(cid) or ""
         if new_raw and title:
-            new_raw = set_leading_string_field(new_raw, title)
+            new_raw = set_summary_title(new_raw, title)
         pb_updates[cid] = new_raw
     if pb_updates:
         stats["pb_entries"] = len(pb_updates)
