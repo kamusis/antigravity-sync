@@ -80,9 +80,65 @@ antigravity-sync import ~/my_conversations.agypkg --dry-run
 antigravity-sync import ~/my_conversations.agypkg \
     --remap-workspace "C:/Users/alice=D:/Users/bob"
 
+# Remap project UUIDs across machines (e.g. same project recreated on both)
+antigravity-sync import ~/my_conversations.agypkg \
+    --remap-project-id "05f52f38-58c8-4a26-9357-4df001980345=cc43b06d-e24a-4b42-8a2f-4112ee58ef8b"
+
 # Full overwrite mode (automatically creates a safety backup of target database)
 antigravity-sync import ~/my_conversations.agypkg --mode overwrite
 ```
+
+The importer keeps imported conversations visible and grouped on the target machine:
+
+- **Trajectory blob patching**: each deployed `conversations/<id>.db` has its embedded
+  `trajectory_metadata_blob` rewritten with the target machine's project UUIDs and
+  workspace paths (protobuf length prefixes recomputed), so the local LanguageServer
+  recognizes them instead of resetting the grouping on rescan.
+- **FTS slug alignment**: `conversations_fts.project` / `.workspace` store directory
+  slugs (not UUIDs); they are aligned with the target machine's own grouping for the
+  mapped project, and cleared for `outside-of-project` conversations.
+- **Title backfill**: missing titles are filled from the source FTS title first and
+  only fall back to `preview` (raw prompt) last.
+- **Historical renames**: source slugs whose project maps to a target project are
+  rewritten to the current target slug (e.g. `moclaw` -> `mopheus`).
+
+### 5. Bidirectional Sync via SSH
+
+```bash
+# Dry-run: see what would be pushed/pulled
+antigravity-sync sync --remote macbook --dry-run
+
+# Full bidirectional sync (auto-detects platform path & project alignment)
+antigravity-sync sync --remote macbook
+
+# One-directional variants
+antigravity-sync sync --remote macbook --push-only
+antigravity-sync sync --remote macbook --pull-only
+```
+
+Both machines must have this repository at `~/CascadeProjects/antigravity-sync`
+(or adjust the paths in `cli.py`). Close Antigravity on both machines before syncing.
+
+### 6. Repair Metadata from Pristine Backups
+
+If a previous import left conversations ungrouped or untitled (e.g. the LanguageServer
+reset them), rebuild both machines' metadata from the pristine backups:
+
+```bash
+# 1. On machine A: dump its pristine ground truth to a snapshot JSON
+python scripts/repair_metadata.py snapshot --side win -o win_snapshot.json
+
+# 2. On machine B: dry-run, then apply the repair using A's snapshot
+python scripts/repair_metadata.py repair --side mac --peer-snapshot win_snapshot.json           # dry-run
+python scripts/repair_metadata.py repair --side mac --peer-snapshot win_snapshot.json --apply
+
+# 3. Verify counts, blob census, titles, and protobuf cache on either machine
+python scripts/verify_repair.py win <peer_snapshot.json>
+```
+
+The repair patches `conversation_summaries`, the FTS index, per-conversation
+trajectory blobs, and `agyhub_summaries_proto.pb`, saving blob originals to a
+timestamped JSON backup before writing.
 
 ---
 
@@ -94,6 +150,7 @@ The `.agypkg` bundle is a standard Deflate ZIP archive containing:
 my_conversations.agypkg
 ├── manifest.json                  # Metadata, versions, checksums, conversation inventory
 ├── conversation_summaries.db      # Sliced SQLite metadata database with FTS5 search index
+├── agyhub_summaries.pb            # Filtered protobuf cache of raw summaries (if present)
 ├── conversations/                 # Individual conversation SQLite databases (<uuid>.db)
 └── brain/                         # Complete transcripts, plans, artifacts, and logs
     └── <uuid>/
