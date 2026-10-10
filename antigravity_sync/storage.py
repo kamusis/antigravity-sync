@@ -49,9 +49,9 @@ def is_antigravity_running() -> bool:
             lower_output = output.lower()
             return any(p in lower_output for p in process_names)
         else:
-            # macOS / Linux
+            # macOS / Linux: match process executable name boundary
             result = subprocess.run(
-                ["pgrep", "-f", "antigravity|language_server"],
+                ["pgrep", "-f", r"(^|/)antigravity(\s|$)|(^|/)language_server(\s|$)"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

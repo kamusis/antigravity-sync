@@ -19,6 +19,16 @@ from antigravity_sync.bundle import (
     read_bundle_manifest,
 )
 from antigravity_sync.merger import import_bundle
+import time
+import tempfile
+from antigravity_sync.remote import (
+    get_remote_conversations,
+    get_remote_platform,
+    auto_detect_remapping,
+    run_ssh_command,
+    scp_upload,
+    scp_download,
+)
 
 if sys.platform == "win32":
     try:
@@ -276,6 +286,129 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Handle the sync command (bidirectional sync with remote machine)."""
+    remote_host = args.remote
+    base_dir = get_antigravity_dir(args.dir)
+    db_path = base_dir / "conversation_summaries.db"
+
+    if not db_path.exists():
+        print(f"Error: Local conversation_summaries.db not found at {db_path}", file=sys.stderr)
+        return 1
+
+    print(f"[*] Checking connection with remote host '{remote_host}'...")
+    try:
+        remote_convs = get_remote_conversations(remote_host)
+    except Exception as e:
+        print(f"Error connecting to remote: {e}", file=sys.stderr)
+        return 1
+
+    local_convs_list = list_conversations_from_db(db_path)
+    local_convs = {c["conversation_id"]: c for c in local_convs_list}
+
+    local_ids = set(local_convs.keys())
+    remote_ids = set(remote_convs.keys())
+
+    to_push_ids = local_ids - remote_ids
+    to_pull_ids = remote_ids - local_ids
+
+    # Compare timestamps on overlapping IDs
+    for cid in (local_ids & remote_ids):
+        l_time = str(local_convs[cid].get("last_modified_time") or "")
+        r_time = str(remote_convs[cid].get("last_modified_time") or "")
+        if l_time > r_time:
+            to_push_ids.add(cid)
+        elif r_time > l_time:
+            to_pull_ids.add(cid)
+
+    print(f"    Local sessions:    {len(local_ids)}")
+    print(f"    Remote sessions:   {len(remote_ids)}")
+    print(f"    Sessions to push:  {len(to_push_ids)}")
+    print(f"    Sessions to pull:  {len(to_pull_ids)}")
+
+    if not to_push_ids and not to_pull_ids:
+        print("\n[+] Both machines are already fully in sync! No changes needed.")
+        return 0
+
+    if args.dry_run:
+        print("\n--- [DRY-RUN SYNC PLAN] ---")
+        if to_push_ids:
+            print(f"  [+] Would push {len(to_push_ids)} conversations to {remote_host}")
+            for cid in list(to_push_ids)[:5]:
+                print(f"      - {cid[:8]} {local_convs[cid].get('title', '')}")
+            if len(to_push_ids) > 5:
+                print(f"      ... and {len(to_push_ids) - 5} more")
+        if to_pull_ids:
+            print(f"  [+] Would pull {len(to_pull_ids)} conversations from {remote_host}")
+            for cid in list(to_pull_ids)[:5]:
+                print(f"      - {cid[:8]} {remote_convs[cid].get('title', '')}")
+            if len(to_pull_ids) > 5:
+                print(f"      ... and {len(to_pull_ids) - 5} more")
+        print("\n[!] Dry run complete. No data transferred.")
+        return 0
+
+    # Auto-detect path remapping
+    remote_plat = get_remote_platform(remote_host)
+    local_user = Path.home().name
+    rc, r_user_out, _ = run_ssh_command(remote_host, "whoami")
+    remote_user = r_user_out.strip() or local_user
+    push_remap, pull_remap = auto_detect_remapping(local_user, remote_user, remote_plat)
+
+    # 1. PUSH to remote
+    if to_push_ids and not args.pull_only:
+        print(f"\n[*] [PUSH] Packaging {len(to_push_ids)} conversation(s) to send to {remote_host}...")
+        with tempfile.TemporaryDirectory(prefix="agy_sync_push_") as td:
+            local_bundle = Path(td) / "push_bundle.agypkg"
+            push_conv_meta = [local_convs[cid] for cid in to_push_ids]
+            create_bundle(base_dir, local_bundle, push_conv_meta, include_scratch=not args.no_scratch)
+
+            remote_tmp = f"/tmp/agy_push_{int(time.time())}.agypkg"
+            print(f"[*] [PUSH] Uploading bundle to {remote_host}:{remote_tmp}...")
+            scp_upload(remote_host, local_bundle, remote_tmp)
+
+            remap_args = " ".join(f'--remap-workspace "{old}={new}"' for old, new in push_remap)
+            import_cmd = f"PYTHONPATH=~/CascadeProjects/antigravity-sync python3 -m antigravity_sync import {remote_tmp} {remap_args} --force"
+            print(f"[*] [PUSH] Merging on {remote_host}...")
+            rc, out, err = run_ssh_command(remote_host, import_cmd)
+            run_ssh_command(remote_host, f"rm -f {remote_tmp}")
+            if rc != 0:
+                print(f"Error during remote import: {err}\nOutput: {out}", file=sys.stderr)
+                return 1
+            print(f"[+] [PUSH] Successfully pushed and merged {len(to_push_ids)} conversations onto {remote_host}!")
+
+    # 2. PULL from remote
+    if to_pull_ids and not args.push_only:
+        print(f"\n[*] [PULL] Requesting {len(to_pull_ids)} conversation(s) from {remote_host}...")
+        with tempfile.TemporaryDirectory(prefix="agy_sync_pull_") as td:
+            remote_tmp = f"/tmp/agy_pull_{int(time.time())}.agypkg"
+            id_args = " ".join(f"--id {cid}" for cid in to_pull_ids)
+            scratch_flag = "--no-scratch" if args.no_scratch else ""
+            export_cmd = f"PYTHONPATH=~/CascadeProjects/antigravity-sync python3 -m antigravity_sync export -o {remote_tmp} {id_args} --force {scratch_flag}"
+            print(f"[*] [PULL] Packaging bundle on {remote_host}...")
+            rc, out, err = run_ssh_command(remote_host, export_cmd)
+            if rc != 0:
+                print(f"Error during remote export: {err}\nOutput: {out}", file=sys.stderr)
+                return 1
+
+            local_bundle = Path(td) / "pull_bundle.agypkg"
+            print(f"[*] [PULL] Downloading bundle from {remote_host}...")
+            scp_download(remote_host, remote_tmp, local_bundle)
+            run_ssh_command(remote_host, f"rm -f {remote_tmp}")
+
+            print("[*] [PULL] Merging into local Antigravity runtime...")
+            import_bundle(
+                bundle_path=local_bundle,
+                target_dir=base_dir,
+                mode="merge",
+                remap_workspaces=pull_remap if pull_remap else None,
+                create_backup=True,
+            )
+            print(f"[+] [PULL] Successfully pulled and merged {len(to_pull_ids)} conversations into local!")
+
+    print("\n[+] Bidirectional sync successfully completed!")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
@@ -284,6 +417,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+    # sync
+    p_sync = subparsers.add_parser("sync", help="Bidirectionally sync conversations with a remote host via SSH")
+    p_sync.add_argument("--remote", required=True, help="Remote SSH host / alias (e.g. macbook or user@host)")
+    p_sync.add_argument("--dir", help="Custom local Antigravity data directory")
+    p_sync.add_argument("--dry-run", action="store_true", help="Simulate sync without transferring data")
+    p_sync.add_argument("--push-only", action="store_true", help="Only push local sessions to remote")
+    p_sync.add_argument("--pull-only", action="store_true", help="Only pull remote sessions to local")
+    p_sync.add_argument("--no-scratch", action="store_true", help="Exclude temporary scratch files from bundles")
+    p_sync.add_argument("--force", action="store_true", help="Proceed even if Antigravity is running")
 
     # export
     p_export = subparsers.add_parser("export", help="Export conversations to an .agypkg bundle")
@@ -325,7 +468,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.print_help()
         return 0
 
-    if args.command == "export":
+    if args.command == "sync":
+        return cmd_sync(args)
+    elif args.command == "export":
         return cmd_export(args)
     elif args.command == "import":
         return cmd_import(args)
