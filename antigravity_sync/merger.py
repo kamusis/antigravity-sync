@@ -449,6 +449,15 @@ def import_bundle(
                             remap_workspaces=remap_workspaces,
                         )
 
+        # 3c. Deploy per-conversation annotations (title/archived state).
+        src_ann_dir = temp_dir / "annotations"
+        if src_ann_dir.exists():
+            target_ann_dir = target / "annotations"
+            target_ann_dir.mkdir(parents=True, exist_ok=True)
+            for f in os.listdir(src_ann_dir):
+                if f.endswith(".pbtxt"):
+                    shutil.copy2(src_ann_dir / f, target_ann_dir / f)
+
         # 4. Deploy brain directories
         target_brain_dir.mkdir(parents=True, exist_ok=True)
         src_brain_dir = temp_dir / "brain"

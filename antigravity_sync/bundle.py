@@ -104,6 +104,14 @@ def create_bundle(
                 files_to_pack.append((temp_pb_path, "agyhub_summaries.pb"))
                 total_uncompressed_bytes += temp_pb_path.stat().st_size
 
+        # Include per-conversation annotations (title/archived state)
+        ann_dir = antigravity_dir / "annotations"
+        for cid in conv_id_set:
+            ann_file = ann_dir / f"{cid}.pbtxt"
+            if ann_file.exists():
+                files_to_pack.append((ann_file, f"annotations/{cid}.pbtxt"))
+                total_uncompressed_bytes += ann_file.stat().st_size
+
         total_convs = len(conversations)
         for idx, conv in enumerate(conversations):
             cid = conv["conversation_id"]

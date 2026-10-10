@@ -47,6 +47,7 @@ from antigravity_sync.proto_utils import (  # noqa: E402
 )
 from antigravity_sync.storage import get_antigravity_dir, backup_file  # noqa: E402
 from antigravity_sync.merger import patch_conversation_blob  # noqa: E402
+from antigravity_sync.annotations import get_annotation_title, set_annotation_title  # noqa: E402
 
 # Pristine backups created before any sync was attempted (see handoff doc).
 DEFAULT_LOCAL_BAK = {
@@ -250,7 +251,7 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
 
     plan: List[str] = []
     stats = {"summaries_updated": 0, "summaries_inserted": 0, "fts_updated": 0,
-             "blobs_patched": 0, "pb_entries": 0}
+             "blobs_patched": 0, "pb_entries": 0, "annotations_patched": 0}
     titles: Dict[str, str] = {}
 
     for cid, peer_row in sorted(peer_summaries.items()):
@@ -393,6 +394,23 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
         blob_backup_path.write_text(json.dumps(blob_backup), encoding="utf-8")
         print(f"[+] Original blobs saved to {blob_backup_path}")
 
+    # Patch annotations/<cid>.pbtxt: the annotation title is the authoritative
+    # store the LanguageServer re-applies when a conversation is opened.
+    ann_patched = 0
+    for cid, peer_row in sorted(peer_summaries.items()):
+        title = titles.get(cid) or ""
+        if not title:
+            continue
+        peer_f = peer_fts.get(cid) or {}
+        archived = bool(peer_f.get("archived"))
+        if get_annotation_title(agy_dir, cid) != title:
+            plan.append(f"PATCH annotation {cid[:8]} title={title[:40]!r}")
+            ann_patched += 1
+            if apply:
+                set_annotation_title(agy_dir, cid, title, archived=archived)
+    if ann_patched:
+        stats["annotations_patched"] = ann_patched
+
     # Patch agyhub_summaries_proto.pb entries for peer conversations.
     pb_updates: Dict[str, bytes] = {}
     for cid in sorted(peer_summaries):
@@ -418,6 +436,7 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
     print(f"fts rows:  {stats['fts_updated']} updated")
     print(f"blobs:     {stats['blobs_patched']} patched")
     print(f"pb:        {stats['pb_entries']} entries")
+    print(f"annotations: {stats['annotations_patched']} patched")
     for line in plan[:40]:
         print(f"  {line}")
     if len(plan) > 40:
