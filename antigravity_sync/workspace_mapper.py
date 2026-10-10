@@ -164,7 +164,10 @@ def build_alignment_mappings(
         if t_slug and t_slug != slug:
             uri_replacements.append((slug, t_slug))
 
-    # 2. General path prefix remapping based on platform and user
+    # 2. General path prefix remapping based on platform and user.
+    # Bare-path rules use a lookbehind so they never match inside an already
+    # remapped URI ('c%3A/Users/x' or 'c:/Users/x'), keeping the rule set
+    # idempotent across repeated syncs.
     if target_platform.lower() == "windows":
         # Remote is POSIX (macOS/Linux), target is Windows
         uri_replacements.extend(
@@ -177,8 +180,18 @@ def build_alignment_mappings(
                     f"file:///home/{source_user}",
                     f"file:///c%3A/Users/{target_user}",
                 ),
-                (f"/Users/{source_user}", f"c:/Users/{target_user}"),
-                (f"/home/{source_user}", f"c:/Users/{target_user}"),
+                (
+                    re.compile(
+                        f"(?<![%:A-Za-z0-9])/Users/{re.escape(source_user)}".encode()
+                    ),
+                    f"c:/Users/{target_user}".encode(),
+                ),
+                (
+                    re.compile(
+                        f"(?<![%:A-Za-z0-9])/home/{re.escape(source_user)}".encode()
+                    ),
+                    f"c:/Users/{target_user}".encode(),
+                ),
             ]
         )
     else:

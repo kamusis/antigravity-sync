@@ -343,6 +343,35 @@ class TestPathReplacement(unittest.TestCase):
             b"file:///c%3A/Users/kamus/CascadeProjects/mopheus and c:/Users/kamus/tmp",
         )
 
+    def test_one_pass_replacer_idempotent_across_runs(self):
+        """Applying the rule set twice must not change already-remapped text."""
+        import re as _re
+        rules = [
+            (b"file:///Users/kamus", b"file:///c%3A/Users/kamus"),
+            (_re.compile(rb"(?<![%:A-Za-z0-9])/Users/kamus"), b"c:/Users/kamus"),
+            (b"c%3Ac:/", b"c%3A/"),
+            (b"c:c:/", b"c:/"),
+        ]
+        replacer = build_one_pass_replacer(rules)
+        fresh = b"file:///Users/kamus/CascadeProjects/mopheus and /Users/kamus/tmp"
+        once = replacer(fresh)
+        twice = replacer(once)
+        self.assertEqual(once, twice)
+        self.assertNotIn(b"c%3Ac:/", twice)
+        self.assertNotIn(b"c:c:/", twice)
+
+    def test_one_pass_replacer_heals_double_application(self):
+        """Corruption from a non-idempotent earlier run must be healed."""
+        import re as _re
+        replacer = build_one_pass_replacer([
+            (b"file:///Users/kamus", b"file:///c%3A/Users/kamus"),
+            (_re.compile(rb"(?<![%:A-Za-z0-9])/Users/kamus"), b"c:/Users/kamus"),
+            (b"c%3Ac:/", b"c%3A/"),
+            (b"c:c:/", b"c:/"),
+        ])
+        corrupted = b"file:///c%3Ac:/Users/kamus/CascadeProjects/mopheus"
+        self.assertEqual(replacer(corrupted), b"file:///c%3A/Users/kamus/CascadeProjects/mopheus")
+
     def test_transform_proto_bytes_reencodes_lengths(self):
         """UUID and path replacements inside nested protobuf must stay wire-valid."""
         blob = make_trajectory_blob(

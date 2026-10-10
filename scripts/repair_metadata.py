@@ -29,6 +29,7 @@ Omit --apply for a dry-run report.
 import base64
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from antigravity_sync.proto_utils import (  # noqa: E402
     build_one_pass_replacer,
     merge_agyhub_proto_file,
+    set_leading_string_field,
     transform_proto_bytes,
 )
 from antigravity_sync.storage import get_antigravity_dir, backup_file  # noqa: E402
@@ -64,9 +66,19 @@ PROJECT_ID_MAP_MAC = {v: k for k, v in PROJECT_ID_MAP_WIN.items()}
 SLUG_RENAMES = [("CascadeProjects/moclaw", "CascadeProjects/mopheus")]
 
 # Generic path prefix rules per target side (applied in one pass, longest first).
+# Bare-path rules carry a lookbehind so they never re-match inside an already
+# remapped URI ('c%3A/Users/kamus' or 'c:/Users/kamus'), keeping the set
+# idempotent across repeated repairs; the heal rules undo that exact
+# duplication if it was written by an earlier non-idempotent run.
+BARE_WIN_USERS = re.compile(rb"(?<![%:A-Za-z0-9])/Users/kamus")
+BARE_WIN_HOME = re.compile(rb"(?<![%:A-Za-z0-9])/home/kamus")
 PATH_RULES_WIN = [
+    ("c%3Ac:/", "c%3A/"),
+    ("c:c:/", "c:/"),
     ("file:///Users/kamus", "file:///c%3A/Users/kamus"),
-    ("/Users/kamus", "c:/Users/kamus"),
+    ("file:///home/kamus", "file:///c%3A/Users/kamus"),
+    (BARE_WIN_USERS, b"c:/Users/kamus"),
+    (BARE_WIN_HOME, b"c:/Users/kamus"),
 ]
 PATH_RULES_MAC = [
     ("file:///c%3A/Users/kamus", "file:///Users/kamus"),
@@ -208,7 +220,10 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
 
     project_id_map = PROJECT_ID_MAP_WIN if side == "win" else PROJECT_ID_MAP_MAC
     path_rules = PATH_RULES_WIN if side == "win" else PATH_RULES_MAC
-    replacements = [(o.encode("utf-8"), n.encode("utf-8")) for o, n in path_rules]
+    replacements = [
+        (o.encode("utf-8"), n.encode("utf-8")) if isinstance(o, str) else (o, n)
+        for o, n in path_rules
+    ]
     replacements += [(o.encode("utf-8"), n.encode("utf-8")) for o, n in SLUG_RENAMES]
     replacements += [
         (s.encode("utf-8"), t.encode("utf-8"))
@@ -236,6 +251,7 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
     plan: List[str] = []
     stats = {"summaries_updated": 0, "summaries_inserted": 0, "fts_updated": 0,
              "blobs_patched": 0, "pb_entries": 0}
+    titles: Dict[str, str] = {}
 
     for cid, peer_row in sorted(peer_summaries.items()):
         peer_f = peer_fts.get(cid)
@@ -256,9 +272,15 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
         new_uris = blob_replacer(uris.encode("utf-8")).decode("utf-8") if uris else uris
 
         # Raw summary: peer live pb entry first, then peer bak column; patched.
+        # Field 1 of the raw summary carries the title the LanguageServer
+        # re-applies when the conversation is opened - keep it in sync with
+        # the repaired title so opening a session does not revert it.
         raw_b64 = peer_pb.get(cid) or peer_row.get("raw_summary_b64") or ""
         raw_bytes = base64.b64decode(raw_b64) if raw_b64 else b""
         new_raw = transform_proto_bytes(raw_bytes, replacements) if raw_bytes else b""
+        if new_raw and title:
+            new_raw = set_leading_string_field(new_raw, title)
+        titles[cid] = title
 
         if live_row is None:
             plan.append(f"INSERT summaries {cid[:8]} pid={mapped_pid[:8]} title={title[:40]!r}")
@@ -378,7 +400,11 @@ def repair_side(side: str, peer_snapshot_path: Path, apply: bool) -> int:
         if not raw_b64:
             continue
         raw = base64.b64decode(raw_b64)
-        pb_updates[cid] = transform_proto_bytes(raw, replacements)
+        new_raw = transform_proto_bytes(raw, replacements)
+        title = titles.get(cid) or ""
+        if new_raw and title:
+            new_raw = set_leading_string_field(new_raw, title)
+        pb_updates[cid] = new_raw
     if pb_updates:
         stats["pb_entries"] = len(pb_updates)
         plan.append(f"PATCH pb entries: {len(pb_updates)}")

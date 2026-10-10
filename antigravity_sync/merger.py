@@ -41,7 +41,7 @@ def build_blob_replacements(
                 replacements.append((s_pid.encode("utf-8"), t_pid.encode("utf-8")))
     if remap_workspaces:
         replacements.extend(
-            (old.encode("utf-8"), new.encode("utf-8"))
+            (old.encode("utf-8"), new.encode("utf-8")) if isinstance(old, str) else (old, new)
             for old, new in remap_workspaces
             if old and old != new
         )
@@ -257,9 +257,10 @@ def merge_summaries_db(
         # 5. Apply path remapping in a single pass (sequential REPLACE would
         # re-match the output of earlier rules and corrupt paths).
         if remap_workspaces:
-            replacer = build_one_pass_replacer(
-                [(old.encode("utf-8"), new.encode("utf-8")) for old, new in remap_workspaces]
-            )
+            replacer = build_one_pass_replacer([
+                (old.encode("utf-8"), new.encode("utf-8")) if isinstance(old, str) else (old, new)
+                for old, new in remap_workspaces
+            ])
             rows = cursor.execute(
                 "SELECT conversation_id, workspace_uris FROM conversation_summaries WHERE workspace_uris IS NOT NULL AND workspace_uris != '';"
             ).fetchall()

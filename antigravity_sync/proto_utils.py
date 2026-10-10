@@ -256,15 +256,17 @@ def _serialize_fields(fields: List[Tuple[int, int, object]]) -> bytes:
     return bytes(res)
 
 
-def build_one_pass_replacer(replacements: List[Tuple[bytes, bytes]]):
-    """Build a single-pass bytes replacer from (old, new) pairs.
+def build_one_pass_replacer(replacements: List[Tuple[object, bytes]]):
+    """Build a single-pass bytes replacer from (pattern, new) pairs.
 
-    Longer patterns are matched first so that overlapping rules (e.g.
-    'file:///Users/x' and '/Users/x') never corrupt each other's output:
-    scanning resumes after each match, so substituted text is never re-matched.
+    Patterns may be plain bytes (escaped literally) or compiled bytes-mode
+    regex patterns (used as-is, e.g. with lookbehind assertions). Longer
+    patterns are matched first so overlapping rules never corrupt each
+    other's output within a pass; rules whose replacement contains the
+    pattern itself must use a lookbehind to stay idempotent across runs.
 
     Args:
-        replacements: List of (old_bytes, new_bytes) pairs.
+        replacements: List of (pattern, new_bytes) pairs.
 
     Returns:
         A function transforming bytes with all replacements applied in one pass.
@@ -272,10 +274,43 @@ def build_one_pass_replacer(replacements: List[Tuple[bytes, bytes]]):
     pairs = [(o, n) for o, n in replacements if o and o != n]
     if not pairs:
         return lambda data: data
-    ordered = sorted(pairs, key=lambda p: len(p[0]), reverse=True)
-    pattern = re.compile(b"|".join(re.escape(o) for o, _ in ordered))
-    mapping = dict(ordered)
-    return lambda data: pattern.sub(lambda m: mapping[m.group(0)], data)
+
+    def source_len(o):
+        return len(o.pattern if isinstance(o, re.Pattern) else o)
+
+    ordered = sorted(pairs, key=lambda p: source_len(p[0]), reverse=True)
+    parts = []
+    for o, _ in ordered:
+        src = o.pattern if isinstance(o, re.Pattern) else re.escape(o)
+        # Wrap each alternative in a group so the match callback can tell
+        # which rule fired via lastindex. Regex rules must therefore use
+        # non-capturing groups (?:...) internally.
+        parts.append(b"(" + src + b")")
+    pattern = re.compile(b"|".join(parts))
+    mapping = {i + 1: n for i, (_, n) in enumerate(ordered)}
+    return lambda data: pattern.sub(lambda m: mapping[m.lastindex], data)
+
+
+def set_leading_string_field(data: bytes, value: str) -> bytes:
+    """Replace the payload of field 1 (wire type 2) in a top-level protobuf message.
+
+    The raw_summary protobuf carries the conversation title in field 1; the
+    LanguageServer re-derives the displayed title from it when a conversation
+    is opened, so a stale field 1 makes the title revert to the raw prompt.
+
+    Args:
+        data: Raw protobuf bytes (e.g. raw_summary).
+        value: New string value for field 1.
+
+    Returns:
+        Re-encoded protobuf bytes, or the input unchanged when field 1 is
+        not a length-delimited field.
+    """
+    fields = _parse_fields_strict(data)
+    if not fields or fields[0][1] != 2:
+        return data
+    new_fields = [(fields[0][0], 2, value.encode("utf-8"))] + list(fields[1:])
+    return _serialize_fields(new_fields)
 
 
 def transform_proto_bytes(data: bytes, replacements: List[Tuple[bytes, bytes]]) -> bytes:
@@ -296,7 +331,10 @@ def transform_proto_bytes(data: bytes, replacements: List[Tuple[bytes, bytes]]) 
     replace = build_one_pass_replacer(replacements)
     # Length-preserving-only replacer: fallback for payloads that are not
     # parseable protobuf, where changing length would corrupt framing.
-    equal_len = [(o, n) for o, n in replacements if len(o) == len(n)]
+    def effective_len(o):
+        return len(o.pattern if isinstance(o, re.Pattern) else o)
+
+    equal_len = [(o, n) for o, n in replacements if effective_len(o) == len(n)]
     replace_equal = build_one_pass_replacer(equal_len)
 
     def walk(buf: bytes, top_level: bool = False) -> bytes:
