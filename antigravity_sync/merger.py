@@ -11,7 +11,92 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 
 from antigravity_sync.storage import backup_file, get_antigravity_dir
 from antigravity_sync.bundle import extract_bundle, read_bundle_manifest
-from antigravity_sync.proto_utils import read_agyhub_proto_file, merge_agyhub_proto_file
+from antigravity_sync.proto_utils import (
+    read_agyhub_proto_file,
+    merge_agyhub_proto_file,
+    build_one_pass_replacer,
+    transform_proto_bytes,
+)
+
+OUTSIDE_PROJECT_ID = "outside-of-project"
+
+
+def build_blob_replacements(
+    project_id_map: Optional[Dict[str, str]],
+    remap_workspaces: Optional[List[Tuple[str, str]]],
+) -> List[Tuple[bytes, bytes]]:
+    """Build byte-level replacement pairs for patching protobuf blobs.
+
+    Args:
+        project_id_map: Mapping of source project UUID to target project UUID.
+        remap_workspaces: List of (old_path, new_path) string pairs.
+
+    Returns:
+        List of (old_bytes, new_bytes) pairs.
+    """
+    replacements: List[Tuple[bytes, bytes]] = []
+    if project_id_map:
+        for s_pid, t_pid in project_id_map.items():
+            if len(s_pid) == 36 and len(t_pid) == 36 and s_pid != t_pid:
+                replacements.append((s_pid.encode("utf-8"), t_pid.encode("utf-8")))
+    if remap_workspaces:
+        replacements.extend(
+            (old.encode("utf-8"), new.encode("utf-8"))
+            for old, new in remap_workspaces
+            if old and old != new
+        )
+    return replacements
+
+
+def patch_conversation_blob(
+    db_path: Path,
+    project_id_map: Optional[Dict[str, str]] = None,
+    remap_workspaces: Optional[List[Tuple[str, str]]] = None,
+) -> bool:
+    """Patch trajectory_metadata_blob inside a conversation database in place.
+
+    Rewrites the embedded project UUID(s) and workspace paths so the local
+    LanguageServer recognizes the conversation as belonging to a local project.
+    Length prefixes are recomputed, keeping the protobuf wire format valid.
+
+    Args:
+        db_path: Path to the conversation <id>.db file.
+        project_id_map: Mapping of source project UUID to target project UUID.
+        remap_workspaces: List of (old_path, new_path) string pairs.
+
+    Returns:
+        True if the blob was modified, False otherwise.
+    """
+    replacements = build_blob_replacements(project_id_map, remap_workspaces)
+    if not replacements or not db_path.exists():
+        return False
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, data FROM trajectory_metadata_blob;")
+        except sqlite3.DatabaseError:
+            # Not a usable SQLite database (e.g. placeholder file): skip.
+            return False
+        rows = cursor.fetchall()
+        changed = False
+        for row_id, data in rows:
+            if not data:
+                continue
+            blob = data if isinstance(data, bytes) else data.encode("utf-8", "surrogateescape")
+            new_blob = transform_proto_bytes(blob, replacements)
+            if new_blob != blob:
+                cursor.execute(
+                    "UPDATE trajectory_metadata_blob SET data = ? WHERE id = ?;",
+                    (new_blob, row_id),
+                )
+                changed = True
+        if changed:
+            conn.commit()
+        return changed
+    finally:
+        conn.close()
 
 
 def get_table_columns(conn: sqlite3.Connection, table_name: str) -> List[str]:
@@ -120,7 +205,25 @@ def merge_summaries_db(
                 SELECT {cols_clause} FROM src.conversations_fts;
             """)
 
-        # 3. Synchronize title and preview so sessions never appear untitled
+        # 3. Synchronize titles so sessions never appear untitled.
+        # Prefer the source FTS title (what the source UI displayed), then the
+        # summaries title, and only fall back to preview (raw prompt) last.
+        if target_has_fts and src_has_fts:
+            cursor.execute("""
+                UPDATE conversation_summaries
+                SET title = (
+                    SELECT f.title FROM conversations_fts f
+                    WHERE f.conversation_id = conversation_summaries.conversation_id
+                      AND f.chunk_index = -1
+                )
+                WHERE (title IS NULL OR title = '')
+                  AND conversation_id IN (SELECT conversation_id FROM src.conversation_summaries)
+                  AND EXISTS (
+                      SELECT 1 FROM conversations_fts f
+                      WHERE f.conversation_id = conversation_summaries.conversation_id
+                        AND f.chunk_index = -1 AND f.title IS NOT NULL AND f.title != ''
+                  );
+            """)
         cursor.execute("""
             UPDATE conversation_summaries
             SET title = preview
@@ -131,32 +234,89 @@ def merge_summaries_db(
             SET preview = title
             WHERE (preview IS NULL OR preview = '') AND title IS NOT NULL AND title != '';
         """)
+        if target_has_fts:
+            cursor.execute("""
+                UPDATE conversations_fts
+                SET title = (
+                    SELECT s.title FROM conversation_summaries s
+                    WHERE s.conversation_id = conversations_fts.conversation_id
+                )
+                WHERE chunk_index = -1 AND (title IS NULL OR title = '')
+                  AND conversation_id IN (SELECT conversation_id FROM src.conversation_summaries);
+            """)
 
-        # 4. Remap project IDs across machines
+        # 4. Remap project IDs across machines (summaries only; the FTS table
+        # stores directory slugs, not UUIDs, and is corrected in step 6).
         if project_id_map:
             for s_pid, t_pid in project_id_map.items():
                 cursor.execute(
                     "UPDATE conversation_summaries SET project_id = ? WHERE project_id = ?;",
                     (t_pid, s_pid),
                 )
-                if target_has_fts:
-                    cursor.execute(
-                        "UPDATE conversations_fts SET project = ? WHERE project = ?;",
-                        (t_pid, s_pid),
-                    )
 
-        # 5. Apply path remapping if requested
+        # 5. Apply path remapping in a single pass (sequential REPLACE would
+        # re-match the output of earlier rules and corrupt paths).
         if remap_workspaces:
-            for old_path, new_path in remap_workspaces:
-                cursor.execute(
-                    "UPDATE conversation_summaries SET workspace_uris = REPLACE(workspace_uris, ?, ?) WHERE workspace_uris LIKE ?;",
-                    (old_path, new_path, f"%{old_path}%")
-                )
-                if target_has_fts:
+            replacer = build_one_pass_replacer(
+                [(old.encode("utf-8"), new.encode("utf-8")) for old, new in remap_workspaces]
+            )
+            rows = cursor.execute(
+                "SELECT conversation_id, workspace_uris FROM conversation_summaries WHERE workspace_uris IS NOT NULL AND workspace_uris != '';"
+            ).fetchall()
+            for cid, uris in rows:
+                new_uris = replacer(uris.encode("utf-8")).decode("utf-8")
+                if new_uris != uris:
                     cursor.execute(
-                        "UPDATE conversations_fts SET workspace = REPLACE(workspace, ?, ?) WHERE workspace LIKE ?;",
-                        (old_path, new_path, f"%{old_path}%")
+                        "UPDATE conversation_summaries SET workspace_uris = ? WHERE conversation_id = ?;",
+                        (new_uris, cid),
                     )
+            if target_has_fts:
+                rows = cursor.execute(
+                    "SELECT rowid, workspace FROM conversations_fts WHERE workspace IS NOT NULL AND workspace != '';"
+                ).fetchall()
+                for rowid, ws in rows:
+                    new_ws = replacer(ws.encode("utf-8")).decode("utf-8")
+                    if new_ws != ws:
+                        cursor.execute(
+                            "UPDATE conversations_fts SET workspace = ? WHERE rowid = ?;",
+                            (new_ws, rowid),
+                        )
+
+        # 6. Align FTS project/workspace slugs with the target machine's own
+        # grouping: derive project_id -> slug from native target rows, then set
+        # each imported conversation's slug accordingly. Conversations mapped
+        # to 'outside-of-project' are ungrouped (''), matching native behavior.
+        if target_has_fts and src_has_fts:
+            pid_slugs: Dict[str, Tuple[str, str]] = {}
+            for row in cursor.execute("""
+                SELECT s.project_id AS pid, f.project AS proj, f.workspace AS ws
+                FROM conversation_summaries s
+                JOIN conversations_fts f
+                  ON f.conversation_id = s.conversation_id AND f.chunk_index = -1
+                WHERE f.project IS NOT NULL AND f.project != ''
+                  AND s.conversation_id NOT IN (SELECT conversation_id FROM src.conversation_summaries);
+            """):
+                pid = row["pid"]
+                if pid and pid != OUTSIDE_PROJECT_ID and pid not in pid_slugs:
+                    pid_slugs[pid] = (row["proj"], row["ws"])
+
+            imported = cursor.execute(
+                "SELECT conversation_id, project_id FROM src.conversation_summaries;"
+            ).fetchall()
+            for cid, src_pid in imported:
+                mapped_pid = project_id_map.get(src_pid, src_pid) if project_id_map else src_pid
+                if mapped_pid in pid_slugs:
+                    proj, ws = pid_slugs[mapped_pid]
+                elif mapped_pid in (OUTSIDE_PROJECT_ID, ""):
+                    proj, ws = "", ""
+                else:
+                    # Unknown/foreign project: keep the copied source slug;
+                    # the local LanguageServer will re-evaluate on rescan.
+                    continue
+                cursor.execute(
+                    "UPDATE conversations_fts SET project = ?, workspace = ? WHERE conversation_id = ? AND chunk_index = -1;",
+                    (proj, ws, cid),
+                )
 
         target_conn.commit()
 
@@ -276,6 +436,17 @@ def import_bundle(
         if src_conv_dir.exists():
             for f in os.listdir(src_conv_dir):
                 shutil.copy2(src_conv_dir / f, target_conv_dir / f)
+            # 3b. Patch trajectory_metadata_blob inside deployed conversation
+            # databases so the local LanguageServer sees local project UUIDs
+            # and paths instead of the source machine's ones.
+            if project_id_map or remap_workspaces:
+                for f in os.listdir(src_conv_dir):
+                    if f.endswith(".db"):
+                        patch_conversation_blob(
+                            target_conv_dir / f,
+                            project_id_map=project_id_map,
+                            remap_workspaces=remap_workspaces,
+                        )
 
         # 4. Deploy brain directories
         target_brain_dir.mkdir(parents=True, exist_ok=True)

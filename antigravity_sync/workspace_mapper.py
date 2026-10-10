@@ -147,6 +147,23 @@ def build_alignment_mappings(
                 if s_clean and t_clean and s_clean != t_clean:
                     uri_replacements.append((s_clean, t_clean))
 
+    # 1b. Infer historical directory renames: a source slug that is absent on
+    # the target machine but whose project_id maps to a target project (e.g.
+    # 'moclaw' directories renamed to 'mopheus') is rewritten to the target
+    # slug so conversations group under the current directory name.
+    target_pid_to_slug = {
+        info["project_id"]: slug
+        for slug, info in target_workspaces.items()
+        if info["project_id"] and info["project_id"] != "outside-of-project"
+    }
+    for slug, s_info in source_workspaces.items():
+        if slug in target_workspaces:
+            continue
+        t_pid = project_id_map.get(s_info["project_id"])
+        t_slug = target_pid_to_slug.get(t_pid) if t_pid else None
+        if t_slug and t_slug != slug:
+            uri_replacements.append((slug, t_slug))
+
     # 2. General path prefix remapping based on platform and user
     if target_platform.lower() == "windows":
         # Remote is POSIX (macOS/Linux), target is Windows

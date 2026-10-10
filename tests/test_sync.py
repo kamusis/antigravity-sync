@@ -25,6 +25,12 @@ from antigravity_sync.bundle import (
 from antigravity_sync.merger import (
     merge_summaries_db,
     import_bundle,
+    patch_conversation_blob,
+)
+from antigravity_sync.proto_utils import (
+    build_one_pass_replacer,
+    transform_proto_bytes,
+    encode_varint,
 )
 
 
@@ -295,6 +301,288 @@ class TestAntigravitySync(unittest.TestCase):
         self.assertTrue((target_dir / "conversation_summaries.db").exists())
         convs = list_conversations_from_db(target_dir / "conversation_summaries.db")
         self.assertEqual(len(convs), 2)
+
+
+def encode_pb_string(field_num: int, payload: bytes) -> bytes:
+    """Encode a single length-delimited protobuf field."""
+    return encode_varint((field_num << 3) | 2) + encode_varint(len(payload)) + payload
+
+
+def make_trajectory_blob(uri: str, project_uuid: str) -> bytes:
+    """Build a minimal trajectory_metadata_blob protobuf value for tests."""
+    inner = encode_pb_string(1, uri.encode("utf-8")) + encode_pb_string(18, project_uuid.encode("utf-8"))
+    return encode_pb_string(1, inner)
+
+
+def make_conversation_db(db_path: Path, uri: str, project_uuid: str) -> None:
+    """Create a minimal conversation <id>.db containing a trajectory blob."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY DEFAULT 'main', data BLOB);"
+    )
+    conn.execute(
+        "INSERT INTO trajectory_metadata_blob (id, data) VALUES ('main', ?);",
+        (make_trajectory_blob(uri, project_uuid),),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestPathReplacement(unittest.TestCase):
+    """Tests for single-pass path replacement and protobuf blob transformation."""
+
+    def test_one_pass_replacer_no_self_corruption(self):
+        """Overlapping rules must not re-match their own output."""
+        replacer = build_one_pass_replacer([
+            (b"file:///Users/kamus", b"file:///c%3A/Users/kamus"),
+            (b"/Users/kamus", b"c:/Users/kamus"),
+        ])
+        result = replacer(b"file:///Users/kamus/CascadeProjects/mopheus and /Users/kamus/tmp")
+        self.assertEqual(
+            result,
+            b"file:///c%3A/Users/kamus/CascadeProjects/mopheus and c:/Users/kamus/tmp",
+        )
+
+    def test_transform_proto_bytes_reencodes_lengths(self):
+        """UUID and path replacements inside nested protobuf must stay wire-valid."""
+        blob = make_trajectory_blob(
+            "file:///Users/kamus/CascadeProjects/mopheus",
+            "05f52f38-58c8-4a26-9357-4df001980345",
+        )
+        replacements = [
+            (b"05f52f38-58c8-4a26-9357-4df001980345", b"cc43b06d-e24a-4b42-8a2f-4112ee58ef8b"),
+            (b"file:///Users/kamus", b"file:///c%3A/Users/kamus"),
+            (b"/Users/kamus", b"c:/Users/kamus"),
+        ]
+        out = transform_proto_bytes(blob, replacements)
+        self.assertIn(b"cc43b06d-e24a-4b42-8a2f-4112ee58ef8b", out)
+        self.assertIn(b"file:///c%3A/Users/kamus/CascadeProjects/mopheus", out)
+        self.assertNotIn(b"/Users/kamus", out.replace(b"c%3A/Users/kamus", b""))
+        # Output must still parse as valid protobuf with the same field layout.
+        from antigravity_sync.proto_utils import _parse_fields_strict
+        fields = _parse_fields_strict(out)
+        self.assertIsNotNone(fields)
+        inner = fields[0][2]
+        inner_fields = _parse_fields_strict(inner)
+        self.assertEqual(inner_fields[0][2], b"file:///c%3A/Users/kamus/CascadeProjects/mopheus")
+        self.assertEqual(inner_fields[1][2], b"cc43b06d-e24a-4b42-8a2f-4112ee58ef8b")
+
+    def test_transform_proto_bytes_roundtrip_identity(self):
+        """No replacements means byte-identical output."""
+        blob = make_trajectory_blob("file:///Users/kamus/x", "05f52f38-58c8-4a26-9357-4df001980345")
+        self.assertEqual(transform_proto_bytes(blob, []), blob)
+
+
+class TestBlobPatching(unittest.TestCase):
+    """Tests for trajectory_metadata_blob patching during import."""
+
+    def test_patch_conversation_blob(self):
+        """patch_conversation_blob rewrites UUID and paths in place."""
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "conv.db"
+            make_conversation_db(
+                db_path,
+                "file:///Users/kamus/CascadeProjects/mopheus",
+                "05f52f38-58c8-4a26-9357-4df001980345",
+            )
+            changed = patch_conversation_blob(
+                db_path,
+                project_id_map={"05f52f38-58c8-4a26-9357-4df001980345": "cc43b06d-e24a-4b42-8a2f-4112ee58ef8b"},
+                remap_workspaces=[("file:///Users/kamus", "file:///c%3A/Users/kamus")],
+            )
+            self.assertTrue(changed)
+            conn = sqlite3.connect(str(db_path))
+            blob = conn.execute("SELECT data FROM trajectory_metadata_blob WHERE id='main'").fetchone()[0]
+            conn.close()
+            self.assertIn(b"cc43b06d-e24a-4b42-8a2f-4112ee58ef8b", blob)
+            self.assertIn(b"file:///c%3A/Users/kamus/CascadeProjects/mopheus", blob)
+            self.assertNotIn(b"05f52f38", blob)
+
+    def test_import_bundle_patches_deployed_blob(self):
+        """import_bundle patches trajectory_metadata_blob of deployed .db files."""
+        src_dir = Path(tempfile.mkdtemp())
+        try:
+            conv_id = "44444444-4444-4444-8444-444444444444"
+            conv_dir = src_dir / "conversations"
+            conv_dir.mkdir(parents=True)
+            make_conversation_db(
+                conv_dir / f"{conv_id}.db",
+                "file:///Users/kamus/CascadeProjects/mopheus",
+                "05f52f38-58c8-4a26-9357-4df001980345",
+            )
+            db_path = src_dir / "conversation_summaries.db"
+            init_mock_antigravity_db(db_path, [{
+                "conversation_id": conv_id,
+                "title": "Mac Session",
+                "preview": "hello",
+                "step_count": 1,
+                "last_modified_time": "2026-10-01T10:00:00Z",
+                "workspace_uris": '["file:///Users/kamus/CascadeProjects/mopheus"]',
+            }])
+            bundle_path = src_dir / "b.agypkg"
+            create_bundle(src_dir, bundle_path, list_conversations_from_db(db_path))
+
+            target_dir = Path(tempfile.mkdtemp()) / "target"
+            import_bundle(
+                bundle_path=bundle_path,
+                target_dir=target_dir,
+                project_id_map={"05f52f38-58c8-4a26-9357-4df001980345": "cc43b06d-e24a-4b42-8a2f-4112ee58ef8b"},
+                remap_workspaces=[("file:///Users/kamus", "file:///c%3A/Users/kamus")],
+                create_backup=False,
+            )
+            deployed = target_dir / "conversations" / f"{conv_id}.db"
+            self.assertTrue(deployed.exists())
+            conn = sqlite3.connect(str(deployed))
+            blob = conn.execute("SELECT data FROM trajectory_metadata_blob WHERE id='main'").fetchone()[0]
+            conn.close()
+            self.assertIn(b"cc43b06d-e24a-4b42-8a2f-4112ee58ef8b", blob)
+            self.assertNotIn(b"05f52f38", blob)
+        finally:
+            import shutil
+            shutil.rmtree(src_dir, ignore_errors=True)
+
+
+class TestMergeSlugAndTitle(unittest.TestCase):
+    """Tests for FTS slug alignment and title backfill in merge_summaries_db."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.target_pid = "cc43b06d-e24a-4b42-8a2f-4112ee58ef8b"
+        self.source_pid = "05f52f38-58c8-4a26-9357-4df001980345"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _make_db(self, db_path: Path, convs, fts_rows):
+        init_mock_antigravity_db(db_path, convs)
+        conn = sqlite3.connect(str(db_path))
+        for conv in convs:
+            conn.execute(
+                "UPDATE conversation_summaries SET project_id=? WHERE conversation_id=?;",
+                (conv.get("project_id", ""), conv["conversation_id"]),
+            )
+        # Mirror the real runtime layout: chunk_index=-1 is the metadata row
+        # carrying title/workspace/project.
+        for row in fts_rows:
+            conn.execute(
+                "UPDATE conversations_fts SET chunk_index=-1, title=?, workspace=?, project=? WHERE conversation_id=?;",
+                (row["title"], row["workspace"], row["project"], row["conversation_id"]),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_fts_project_aligned_by_target_native_slug(self):
+        """FTS project/workspace must follow the target slug for the mapped project."""
+        target_db = self.root / "target.db"
+        native_id = "55555555-5555-4555-8555-555555555555"
+        self._make_db(
+            target_db,
+            [{
+                "conversation_id": native_id,
+                "title": "Native",
+                "preview": "p",
+                "step_count": 1,
+                "last_modified_time": "2026-10-01T10:00:00Z",
+                "workspace_uris": '["file:///c%3A/Users/kamus/CascadeProjects/mopheus"]',
+                "project_id": self.target_pid,
+            }],
+            [{"conversation_id": native_id, "title": "Native", "workspace": "mopheus", "project": "mopheus"}],
+        )
+        source_db = self.root / "source.db"
+        incoming_id = "66666666-6666-4666-8666-666666666666"
+        self._make_db(
+            source_db,
+            [{
+                "conversation_id": incoming_id,
+                "title": "",
+                "preview": "raw prompt text",
+                "step_count": 1,
+                "last_modified_time": "2026-10-02T10:00:00Z",
+                "workspace_uris": '["file:///Users/kamus/CascadeProjects/moclaw"]',
+                "project_id": self.source_pid,
+            }],
+            [{"conversation_id": incoming_id, "title": "Real Session Title", "workspace": "moclaw", "project": "moclaw"}],
+        )
+
+        merge_summaries_db(
+            target_db,
+            source_db,
+            remap_workspaces=[
+                ("file:///Users/kamus", "file:///c%3A/Users/kamus"),
+                ("CascadeProjects/moclaw", "CascadeProjects/mopheus"),
+            ],
+            project_id_map={self.source_pid: self.target_pid},
+        )
+
+        conn = sqlite3.connect(str(target_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            s = dict(conn.execute("SELECT * FROM conversation_summaries WHERE conversation_id=?", (incoming_id,)).fetchone())
+            f = dict(conn.execute("SELECT * FROM conversations_fts WHERE conversation_id=? AND chunk_index=-1", (incoming_id,)).fetchone())
+        finally:
+            conn.close()
+        self.assertEqual(s["project_id"], self.target_pid)
+        self.assertEqual(s["title"], "Real Session Title")
+        self.assertEqual(f["project"], "mopheus")
+        self.assertEqual(f["workspace"], "mopheus")
+        self.assertEqual(f["title"], "Real Session Title")
+        self.assertIn("CascadeProjects/mopheus", s["workspace_uris"])
+        self.assertNotIn("moclaw", s["workspace_uris"])
+
+    def test_outside_project_ungrouped(self):
+        """Conversations mapped to outside-of-project get empty FTS slugs."""
+        target_db = self.root / "target.db"
+        native_id = "77777777-7777-4777-8777-777777777777"
+        self._make_db(
+            target_db,
+            [{
+                "conversation_id": native_id,
+                "title": "Native",
+                "preview": "p",
+                "step_count": 1,
+                "last_modified_time": "2026-10-01T10:00:00Z",
+                "workspace_uris": '["file:///c%3A/Users/kamus/CascadeProjects/mopheus"]',
+                "project_id": self.target_pid,
+            }],
+            [{"conversation_id": native_id, "title": "Native", "workspace": "mopheus", "project": "mopheus"}],
+        )
+        source_db = self.root / "source.db"
+        incoming_id = "88888888-8888-4888-8888-888888888888"
+        self._make_db(
+            source_db,
+            [{
+                "conversation_id": incoming_id,
+                "title": "T",
+                "preview": "p",
+                "step_count": 1,
+                "last_modified_time": "2026-10-02T10:00:00Z",
+                "workspace_uris": '["file:///Users/kamus/CascadeProjects/ruflo"]',
+                "project_id": self.source_pid,
+            }],
+            [{"conversation_id": incoming_id, "title": "T", "workspace": "ruflo", "project": "ruflo"}],
+        )
+
+        merge_summaries_db(
+            target_db,
+            source_db,
+            remap_workspaces=[("file:///Users/kamus", "file:///c%3A/Users/kamus")],
+            project_id_map={self.source_pid: "outside-of-project"},
+        )
+
+        conn = sqlite3.connect(str(target_db))
+        try:
+            f = conn.execute(
+                "SELECT project, workspace FROM conversations_fts WHERE conversation_id=? AND chunk_index=-1",
+                (incoming_id,),
+            ).fetchone()
+            s_pid = conn.execute(
+                "SELECT project_id FROM conversation_summaries WHERE conversation_id=?", (incoming_id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(s_pid, "outside-of-project")
+        self.assertEqual(f, ("", ""))
 
 
 if __name__ == "__main__":
