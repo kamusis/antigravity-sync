@@ -158,8 +158,7 @@ antigravity-sync sync --remote macbook --push-only
 antigravity-sync sync --remote macbook --pull-only
 ```
 
-Both machines must have this repository at `~/CascadeProjects/antigravity-sync`
-(or adjust the paths in `cli.py`). Close Antigravity on both machines before syncing.
+Both machines must have this repository available (e.g. at `~/projects/antigravity-sync`, or installed via pip). Close Antigravity on both machines before syncing.
 
 ### 6. Repair Metadata from Pristine Backups
 
@@ -181,6 +180,49 @@ python scripts/verify_repair.py win <peer_snapshot.json>
 The repair patches `conversation_summaries`, the FTS index, per-conversation
 trajectory blobs, and `agyhub_summaries_proto.pb`, saving blob originals to a
 timestamped JSON backup before writing.
+
+---
+
+## Agent Skill (`agy-sync`)
+
+A built-in Agent skill is provided under [`skills/agy-sync`](skills/agy-sync/SKILL.md) to let AI assistants (e.g. Antigravity, Claude Code, Cursor) safely execute conversation migrations, inspections, and sync operations via natural language.
+
+### Installation / Activation
+
+Symlink or copy the skill directory into your active AI assistant skills path:
+
+```bash
+# For Antigravity directly (run from repository root):
+ln -s "$(pwd)/skills/agy-sync" ~/.gemini/antigravity/skills/agy-sync
+
+# Or via Axon Hub (central skill repository across machines):
+cp -r skills/agy-sync ~/.axon/repo/skills/
+axon sync
+```
+
+### Example Natural Language Prompts
+
+Agents equipped with `agy-sync` will automatically validate prerequisites (such as ensuring target Antigravity processes are closed to avoid WAL lock conflicts), run `--dry-run` simulations before modifying databases, and handle cross-platform path remappings.
+
+#### 1. Remote SSH Synchronization
+- *"把这台机器上的 Antigravity 会话同步到远程机器 macbook，先看下有哪些会话会变动"* — Preview bidirectional sync changes with `macbook` before applying.
+- *"从远程开发机 dev-server 把最新的 Antigravity 会话拉取到本地，只拉取不推送"* — Execute a `--pull-only` synchronization from `dev-server` into local storage.
+- *"Push all my local conversations from today to my laptop over SSH."*
+
+#### 2. Bundle Export & Backup
+- *"帮我把当前这台电脑上 2026-09-01 之后的所有 Antigravity 会话导出一个包，不要包含临时的 scratch 文件，保存为 ~/backup_clean.agypkg"* — Export filtered sessions with `--since` and `--no-scratch`.
+- *"把当前环境中与 'mopheus' 相关的会话全部打包导出到 ~/mopheus_sessions.agypkg"*
+
+#### 3. Cross-Platform Import & Path Remapping
+- *"我收到了一个来自同事 Windows 电脑的会话包 win_export.agypkg，他的工程路径是 C:/Users/alice/projects/demo，而我的 Linux 路径是 /home/bob/projects/demo，怎么把它安全合并进我的 Antigravity 里？"* — Inspects bundle, simulates with `--dry-run`, and performs non-destructive merge with `--remap-workspace`.
+- *"Simulate importing ~/backup.agypkg and show me if there are any conflicts."*
+
+#### 4. Diagnostics & Inspection
+- *"查一下我本地当前 Antigravity 运行状态和最近的 10 个对话历史"* — Runs `inspect --local` and `list -n 10`.
+- *"不解压，帮我看下 ~/incoming_sessions.agypkg 里面包含哪些会话和元数据"* — Runs `inspect` and `list -f` on the archive.
+
+#### 5. Metadata & Grouping Repair
+- *"同步完后有些会话丢失了工程归属显示在 outside-of-project，帮我修复元数据"* — Runs metadata verification and repair scripts using peer snapshot.
 
 ---
 

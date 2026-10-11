@@ -1,0 +1,51 @@
+{
+  "skill_name": "agy-sync",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "把这台机器上的 Antigravity 会话同步到远程机器 macbook，先看下有哪些会话会变动",
+      "expected_output": "The agent inspects remote connectivity, runs antigravity_sync sync --remote macbook --dry-run, reports the preview of push/pull sessions, and checks whether Antigravity processes should be closed before proceeding.",
+      "files": [],
+      "expectations": [
+        "Identifies that the user wants to preview sync before executing live modifications",
+        "Uses python3 -m antigravity_sync sync --remote macbook --dry-run",
+        "Mentions closing Antigravity on both machines if proceeding with live write",
+        "Does not perform destructive or unconfirmed sync without dry-run"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "帮我把当前这台电脑上 2026-09-01 之后的所有 Antigravity 会话导出一个包，不要包含临时的 scratch 文件，保存为 ~/backup_clean.agypkg",
+      "expected_output": "The agent executes the export command with appropriate arguments (--since, --no-scratch, -o).",
+      "files": [],
+      "expectations": [
+        "Uses python3 -m antigravity_sync export command",
+        "Includes --since 2026-09-01 flag",
+        "Includes --no-scratch flag to exclude temporary files",
+        "Specifies output path ~/backup_clean.agypkg"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "我收到了一个来自同事 Windows 电脑的会话包 win_export.agypkg，他的工程路径是 C:/Users/alice/projects/demo，而我的 Linux 路径是 /home/bob/projects/demo，怎么把它安全合并进我的 Antigravity 里？",
+      "expected_output": "The agent inspects the bundle, explains the safety check, runs a dry-run import with path remapping, and provides the command with --remap-workspace.",
+      "files": [],
+      "expectations": [
+        "Recommends inspecting the bundle with python3 -m antigravity_sync inspect win_export.agypkg",
+        "Runs or suggests --dry-run first to preview merge impact",
+        "Constructs import command using --remap-workspace 'C:/Users/alice/projects/demo=/home/bob/projects/demo'",
+        "Warns user to ensure Antigravity is not currently running"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "查一下我本地当前 Antigravity 运行状态和最近的 10 个对话历史",
+      "expected_output": "The agent inspects local installation status and lists conversations.",
+      "files": [],
+      "expectations": [
+        "Uses python3 -m antigravity_sync inspect --local to check running status and stats",
+        "Uses python3 -m antigravity_sync list -n 10 to display the 10 most recent sessions"
+      ]
+    }
+  ]
+}
