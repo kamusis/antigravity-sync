@@ -196,28 +196,29 @@ def build_alignment_mappings(
         )
     else:
         # Remote is Windows, target is POSIX (macOS/Linux)
+        target_root = "Users" if target_platform.lower() == "darwin" else "home"
         uri_replacements.extend(
             [
                 (
                     f"file:///c%3A/Users/{source_user}",
-                    f"file:///Users/{target_user}",
+                    f"file:///{target_root}/{target_user}",
                 ),
                 (
                     f"file:///c:/Users/{source_user}",
-                    f"file:///Users/{target_user}",
+                    f"file:///{target_root}/{target_user}",
                 ),
                 (
                     f"file:///C%3A/Users/{source_user}",
-                    f"file:///Users/{target_user}",
+                    f"file:///{target_root}/{target_user}",
                 ),
                 (
                     f"file:///C:/Users/{source_user}",
-                    f"file:///Users/{target_user}",
+                    f"file:///{target_root}/{target_user}",
                 ),
-                (f"c:/Users/{source_user}", f"/Users/{target_user}"),
-                (f"C:/Users/{source_user}", f"/Users/{target_user}"),
-                (f"c:\\Users\\{source_user}", f"/Users/{target_user}"),
-                (f"C:\\Users\\{source_user}", f"/Users/{target_user}"),
+                (f"c:/Users/{source_user}", f"/{target_root}/{target_user}"),
+                (f"C:/Users/{source_user}", f"/{target_root}/{target_user}"),
+                (f"c:\\Users\\{source_user}", f"/{target_root}/{target_user}"),
+                (f"C:\\Users\\{source_user}", f"/{target_root}/{target_user}"),
             ]
         )
 

@@ -143,27 +143,29 @@ def auto_detect_remapping(local_user: str, remote_user: str, remote_platform: st
     push_rules = []
     pull_rules = []
 
-    if sys.platform == "win32" and remote_platform == "Darwin":
-        # Windows -> macOS
+    if sys.platform == "win32" and remote_platform in ("Darwin", "Linux"):
+        remote_root = "Users" if remote_platform == "Darwin" else "home"
+        # Windows -> POSIX
         push_rules = [
-            (f"c:/Users/{local_user}", f"/Users/{remote_user}"),
-            (f"C:/Users/{local_user}", f"/Users/{remote_user}"),
-            (f"c:\\Users\\{local_user}", f"/Users/{remote_user}"),
-            (f"C:\\Users\\{local_user}", f"/Users/{remote_user}"),
+            (f"c:/Users/{local_user}", f"/{remote_root}/{remote_user}"),
+            (f"C:/Users/{local_user}", f"/{remote_root}/{remote_user}"),
+            (f"c:\\Users\\{local_user}", f"/{remote_root}/{remote_user}"),
+            (f"C:\\Users\\{local_user}", f"/{remote_root}/{remote_user}"),
         ]
-        # macOS -> Windows
+        # POSIX -> Windows
         pull_rules = [
-            (f"/Users/{remote_user}", f"c:/Users/{local_user}"),
+            (f"/{remote_root}/{remote_user}", f"c:/Users/{local_user}"),
         ]
-    elif sys.platform == "darwin" and remote_platform == "Windows":
-        # macOS -> Windows
+    elif sys.platform in ("darwin", "linux") and remote_platform == "Windows":
+        local_root = "Users" if sys.platform == "darwin" else "home"
+        # POSIX -> Windows
         push_rules = [
-            (f"/Users/{local_user}", f"c:/Users/{remote_user}"),
+            (f"/{local_root}/{local_user}", f"c:/Users/{remote_user}"),
         ]
-        # Windows -> macOS
+        # Windows -> POSIX
         pull_rules = [
-            (f"c:/Users/{remote_user}", f"/Users/{local_user}"),
-            (f"C:/Users/{remote_user}", f"/Users/{local_user}"),
+            (f"c:/Users/{remote_user}", f"/{local_root}/{local_user}"),
+            (f"C:/Users/{remote_user}", f"/{local_root}/{local_user}"),
         ]
 
     return push_rules, pull_rules
